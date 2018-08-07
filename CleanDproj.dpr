@@ -7,24 +7,28 @@ program CleanDproj;
 uses
   System.SysUtils,
   System.Classes,
+  System.IOUtils,
   Winapi.ActiveX,
   Dv.CleanDProj in 'Dv.CleanDProj.pas';
 
 var
-  AStream: TStream;
   I: Integer;
+  AFileName: string;
+  AFiles: TArray<string>;
 begin
   CoInitialize(nil);
   try
     try
       for I := 1 to ParamCount do
       begin
-        AStream := TFileStream.Create(ParamStr(I), fmOpenReadWrite);
-        try
-          DoCleanDproj(AStream);
-        finally
-          AStream.Free;
-        end;
+        if FileExists(ParamStr(I)) then
+          DoCleanDproj(ParamStr(I));
+      end;
+      if (ParamCount = 1) and (ParamStr(1) = 'dir') then
+      begin
+        AFiles := TArray<string>(TDirectory.GetFiles(GetCurrentDir, '*.dproj', TSearchOption.soAllDirectories));
+        for AFileName in AFiles do
+          DoCleanDproj(AFileName);
       end;
     except
       on E: Exception do

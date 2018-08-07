@@ -8,26 +8,60 @@ uses
   System.Generics.Collections,
   System.Generics.Defaults,
   System.Variants,
+  Winapi.Windows,
   XML.XMLIntf,
-  XML.XMLDoc;
+  XML.XMLDoc,
+  XML.XMLDom;
 
-procedure DoCleanDproj(AStream: TStream);
+procedure DoCleanDproj(AFileName: string); overload;
+procedure DoCleanDproj(AStream: TStream); overload;
+procedure SortNodes(ANodes: IXMLNodeList);
 
 implementation
 
-function FindFirstNode(AParent: IXMLNode; ANodes: TArray<string>): IXMLNode;
+function NodeHasAllAttrs(ANode: IXMLNode; ASearchNode: IXMLNode): Boolean;
 var
   I: Integer;
+  AAttrNode: IXMLNode;
+  AAttrName: string;
 begin
-  Result := AParent;
-  for I := 0 to High(ANodes) do
+  Result := True;
+  for I := 0 to ASearchNode.AttributeNodes.Count - 1 do
   begin
-    Result := Result.ChildNodes.FindNode(ANodes[I]);
-    if Result = nil then
-      Break;
+    AAttrName := ASearchNode.AttributeNodes[I].NodeName;
+    AAttrNode := ANode.AttributeNodes.FindNode(ASearchNode.AttributeNodes[I].NodeName);
+    if (AAttrNode = nil) or (AAttrNode.Text <> ASearchNode.AttributeNodes[I].Text) then
+      Exit(False);
   end;
-  if I <> Length(ANodes) then
-    Result := nil;
+end;
+
+// From a post in Embarcadero's Delphi XML forum.
+function SelectNode(xnRoot: IXmlNode; const nodePath: WideString): IXmlNode;
+var
+  intfSelect : IDomNodeSelect;
+  dnResult : IDomNode;
+  intfDocAccess : IXmlDocumentAccess;
+  doc: TXmlDocument;
+begin
+  Result := nil;
+  if not Assigned(xnRoot) or not Supports(xnRoot.DOMNode, IDomNodeSelect, intfSelect) then
+    Exit;
+  dnResult := intfSelect.selectNode(nodePath);
+  if Assigned(dnResult) then
+  begin
+    if Supports(xnRoot.OwnerDocument, IXmlDocumentAccess, intfDocAccess) then
+      doc := intfDocAccess.DocumentObject
+    else
+      doc := nil;
+    Result := TXmlNode.Create(dnResult, nil, doc);
+  end;
+end;
+
+function FindOrAddNode(AParent: IXMLNode; ATagName: string): IXMLNode;
+begin
+  Result := AParent.ChildNodes.FindNode(ATagName);
+  if Result = nil then
+    Result := AParent.AddChild(ATagName);
 end;
 
 function NodeListToArray(ANodes: IXMLNodeList): TArray<IXMLNode>;
@@ -90,13 +124,30 @@ var
   ANodeArray: TArray<IXMLNode>;
   I: Integer;
 begin
+  if ANodes.Count = 0 then
+    Exit;
   SetLength(ANodeArray, ANodes.Count);
   for I := 0 to ANodes.Count - 1 do
+  begin
+    SortNodes(ANodes.Nodes[I].ChildNodes);
     ANodeArray[I] := ANodes.Nodes[I];
+  end;
   TArray.Sort<IXMLNode>(ANodeArray, TComparer<IXMLNode>.Construct(CompareXMLNode));
   ANodes.Clear;
   for I := 0 to Length(ANodeArray) - 1 do
     ANodes.Add(ANodeArray[I]);
+end;
+
+procedure DoCleanDproj(AFileName: string); overload;
+var
+  AStream: TStream;
+begin
+  AStream := TFileStream.Create(AFileName, fmOpenReadWrite);
+  try
+    DoCleanDproj(AStream);
+  finally
+    AStream.Free;
+  end;
 end;
 
 procedure DoCleanDproj(AStream: TStream);
@@ -106,51 +157,67 @@ var
   ANode: IXMLNode;
   AStreamReader: TStreamReader;
   AStreamWriter: TStreamWriter;
-  AText: string;
+  AStringBuilder: TStringBuilder;
 begin
   ADocument := NewXMLDocument;
   // Import
   ADocument.NodeIndentStr := '    ';
-  ADocument.Options := ADocument.Options + [doNodeAutoIndent];
-  //ADocument.ParseOptions := [poValidateOnParse, poPreserveWhiteSpace];
+  ADocument.Options := [doNodeAutoCreate, doAttrNull, doAutoPrefix, doNamespaceDecl];
+  ADocument.ParseOptions := [];
   ADocument.LoadFromStream(AStream, xetUTF_8);
+  // Set sensible error options
+  //ASearchNode := ADocument.CreateNode('Project', ntElement);
+  //ASearchNode.AddChild('PropertyGroup').Attributes['Condition'] := '''$(Base)''!=''''';
+  ANode := SelectNode(ADocument.DocumentElement, '//*[local-name()=''PropertyGroup''][@Condition="''$(Base)''!=''''"]');
+  if ANode <> nil then
+  begin
+    FindOrAddNode(ANode, 'DCC_USE_BEFORE_DEF').Text := 'error';
+    FindOrAddNode(ANode, 'DCC_NO_RETVAL').Text := 'error';
+    SortNodes(ANode.ChildNodes);
+  end;
   // Sort the shit
-  ANode := FindFirstNode(ADocument.Node, ['Project', 'ProjectExtensions', 'BorlandProject', 'Deployment']);
+  ANode := SelectNode(ADocument.DocumentElement, '//*[local-name()=''ProjectExtensions'']/*[local-name()=''BorlandProject'']/*[local-name()=''Deployment'']');
   if ANode <> nil then
     SortNodes(ANode.ChildNodes);
-  ANode := FindFirstNode(ADocument.Node, ['Project', 'ItemGroup']);
+  ANode := SelectNode(ADocument.DocumentElement, '//*[local-name()=''Project'']/*[local-name()=''ItemGroup'']');
   if ANode <> nil then
     SortNodes(ANode.ChildNodes);
   // Reset file
   AStream.Position := 0;
   AStream.Size := 0;
   // Reset build config
-  ANode := FindFirstNode(ADocument.Node, ['Project', 'PropertyGroup', 'Config']);
+  ANode := SelectNode(ADocument.DocumentElement, '//*[local-name()=''Project'']/*[local-name()=''PropertyGroup'']/*[local-name()=''Config'']');
   if ANode <> nil then
     ANode.Text := 'Release';
-  // Save the xml
-  ADocument.SaveToStream(AStream);
-  // Replace tabs for spaces
-  AStreamReader := TStreamReader.Create(AStream, True);
+  AStringBuilder := TStringBuilder.Create;
   try
-    AStream.Position := 0;
-    AText := AStreamReader.ReadToEnd;
+    // Save the xml
+    ADocument.SaveToStream(AStream);
+    // Replace tabs for spaces
+    AStreamReader := TStreamReader.Create(AStream, True);
+    try
+      AStream.Position := 0;
+      AStringBuilder.Append(AStreamReader.ReadToEnd);
+    finally
+      AStreamReader.Free;
+    end;
+    AStringBuilder.Replace(#9, '    ');
+
+    AStreamWriter := TStreamWriter.Create(AStream, TEncoding.UTF8);
+    try
+      // Reset file
+      AStream.Position := 0;
+      AStream.Size := 0;
+      // Write an encoding byte-order mark and buffer to output file.
+      AByteOrderMark := TUTF8Encoding.UTF8.GetPreamble;
+      AStream.Write(AByteOrderMark[0], Length(AByteOrderMark));
+      // Remove lines
+      AStreamWriter.Write(AStringBuilder.ToString);
+    finally
+      AStreamWriter.Free;
+    end;
   finally
-    AStreamReader.Free;
-  end;
-  AStreamWriter := TStreamWriter.Create(AStream, TEncoding.UTF8);
-  try
-    // Reset file
-    AStream.Position := 0;
-    AStream.Size := 0;
-    // Write an encoding byte-order mark and buffer to output file.
-    AByteOrderMark := TUTF8Encoding.UTF8.GetPreamble;
-    AStream.Write(AByteOrderMark[0], Length(AByteOrderMark));
-    // Remove lines
-    AText := AText.Replace(#9, '    ');
-    AStreamWriter.Write(AText);
-  finally
-    AStreamWriter.Free;
+    AStringBuilder.Free;
   end;
 end;
 
